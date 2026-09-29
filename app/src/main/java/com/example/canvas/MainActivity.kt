@@ -104,6 +104,7 @@ import androidx.media3.ui.PlayerView
 import com.example.canvas.ui.theme.CanvasEditorColors
 import com.example.canvas.ui.theme.CanvasTheme
 import kotlinx.coroutines.delay
+import java.io.File
 import java.util.UUID
 import kotlin.math.abs
 
@@ -227,10 +228,11 @@ class MainActivity : ComponentActivity() {
             if (uris.isNotEmpty()) {
                 val newClips = uris.mapIndexed { index, uri ->
                     val name = queryDisplayName(uri) ?: "Video ${viewModel.project.videoClips.size + index + 1}"
-                    val durationMs = VideoExportManager.getVideoDurationMs(this, uri)
-                    val (nativeW, nativeH) = VideoExportManager.getVideoDimensions(this, uri)
+                    val localUri = copyImportedAsset(uri, "video")
+                    val durationMs = VideoExportManager.getVideoDurationMs(this, localUri)
+                    val (nativeW, nativeH) = VideoExportManager.getVideoDimensions(this, localUri)
                     VideoClip(
-                        uri = uri,
+                        uri = localUri,
                         name = name,
                         sourceDurationMs = durationMs,
                         nativeWidthPx = nativeW,
@@ -247,15 +249,17 @@ class MainActivity : ComponentActivity() {
         }
 
     private val audioPicker =
-        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
             uri?.let {
+                persistReadPermission(it)
                 val name = queryDisplayName(it) ?: "Audio ${viewModel.project.audioClips.size + 1}"
-                val durationMs = VideoExportManager.getVideoDurationMs(this, it)
+                val localUri = copyImportedAsset(it, "audio")
+                val durationMs = VideoExportManager.getVideoDurationMs(this, localUri)
                 val videoProjectDuration = viewModel.project.totalDurationMs
                 val defaultTrimEnd = if (videoProjectDuration > 0L) videoProjectDuration.coerceAtMost(durationMs) else durationMs
 
                 val newAudio = AudioClip(
-                    uri = it,
+                    uri = localUri,
                     name = name,
                     sourceDurationMs = durationMs,
                     trimStartMs = 0L,
@@ -271,11 +275,13 @@ class MainActivity : ComponentActivity() {
         }
 
     private val imagePicker =
-        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
             uri?.let {
+                persistReadPermission(it)
                 val name = queryDisplayName(it) ?: "Overlay ${viewModel.project.imageOverlays.size + 1}"
+                val localUri = copyImportedAsset(it, "image")
                 val newOverlay = ImageOverlayItem(
-                    uri = it,
+                    uri = localUri,
                     name = name,
                     startTimeMs = viewModel.project.playheadPositionMs,
                     durationMs = 10000L
@@ -293,6 +299,33 @@ class MainActivity : ComponentActivity() {
         return contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
             if (nameIndex >= 0 && cursor.moveToFirst()) cursor.getString(nameIndex) else null
+        }
+    }
+
+    private fun persistReadPermission(uri: Uri) {
+        if (uri.scheme != "content") return
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (_: SecurityException) {
+            // Some providers grant only temporary access; the current export can still use it.
+        }
+    }
+
+    private fun copyImportedAsset(uri: Uri, type: String): Uri {
+        if (uri.scheme != "content") return uri
+        return try {
+            val sourceName = queryDisplayName(uri)
+                ?.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                ?.takeLast(80)
+                ?: "$type.bin"
+            val directory = File(filesDir, "imported_media").apply { mkdirs() }
+            val destination = File(directory, "${UUID.randomUUID()}_$sourceName")
+            contentResolver.openInputStream(uri)?.use { input ->
+                destination.outputStream().use { output -> input.copyTo(output) }
+            } ?: return uri
+            Uri.fromFile(destination)
+        } catch (_: Exception) {
+            uri
         }
     }
 
@@ -314,8 +347,8 @@ class MainActivity : ComponentActivity() {
                         onUpdateProject = { transform -> viewModel.updateProject(this, transform) },
                         onOpenDraftsScreen = { viewModel.closeEditor(this) },
                         onAddVideo = { videoPicker.launch("video/*") },
-                        onAddAudio = { audioPicker.launch("audio/*") },
-                        onAddImageOverlay = { imagePicker.launch("image/*") }
+                        onAddAudio = { audioPicker.launch(arrayOf("audio/*")) },
+                        onAddImageOverlay = { imagePicker.launch(arrayOf("image/*")) }
                     )
                 } else {
                     ProjectsScreen(
