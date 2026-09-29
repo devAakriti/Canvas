@@ -636,11 +636,9 @@ fun CanvasApp(
                     }
                 } else {
                     Box(modifier = aspectModifier, contentAlignment = Alignment.Center) {
-                        // Determine currently playing video clip based on playhead position
                         var currentPlayingClip: VideoClip? = null
                         var currentClipStartMs = 0L
                         var accMs = 0L
-
                         for (clip in project.videoClips) {
                             val duration = clip.trimmedDurationMs
                             if (project.playheadPositionMs in accMs until (accMs + duration)) {
@@ -651,28 +649,36 @@ fun CanvasApp(
                             accMs += duration
                         }
                         if (currentPlayingClip == null) {
-                            currentPlayingClip = project.videoClips.lastOrNull()
-                            currentClipStartMs = project.videoClips.dropLast(1).sumOf { it.trimmedDurationMs }
+                            currentPlayingClip = selectedVideoClip ?: project.videoClips.lastOrNull()
+                            currentClipStartMs = project.videoClips.takeWhile { it.id != (currentPlayingClip?.id ?: "") }.sumOf { it.trimmedDurationMs }
                         }
 
-                        val playheadInClipMs = (project.playheadPositionMs - currentClipStartMs).coerceAtLeast(0L)
-                        val activeTransform = currentPlayingClip?.interpolatedTransformAt(playheadInClipMs)
+                        val activePreviewClip = currentPlayingClip ?: selectedVideoClip ?: project.videoClips.lastOrNull()
+                        val playheadInClipMs = if (activePreviewClip != null) {
+                            (project.playheadPositionMs - currentClipStartMs).coerceAtLeast(0L)
+                        } else 0L
+                        val activeTransform = activePreviewClip?.interpolatedTransformAt(playheadInClipMs)
 
-                        // Live Transition Animate-In Calculation ONLY for current playing clip
-                        val transDurationMs = (currentPlayingClip?.transitionDurationMs ?: 500L).coerceAtLeast(100L)
-                        val transFrac = (playheadInClipMs.toFloat() / transDurationMs).coerceIn(0f, 1f)
+                        val transDurationMs = (activePreviewClip?.transitionDurationMs ?: 500L).coerceAtLeast(100L)
+                        val transitionWindowStartMs = ((activePreviewClip?.trimmedDurationMs ?: 0L) - transDurationMs).coerceAtLeast(0L)
+                        val isTransitionActive = activePreviewClip?.transitionToNext != null &&
+                            activePreviewClip.transitionToNext != TransitionType.NONE &&
+                            playheadInClipMs >= transitionWindowStartMs
+                        val transFrac = if (isTransitionActive) {
+                            ((playheadInClipMs - transitionWindowStartMs).toFloat() / transDurationMs.toFloat()).coerceIn(0f, 1f)
+                        } else 0f
 
-                        val transOffsetX = if (playheadInClipMs < transDurationMs) {
-                            when (currentPlayingClip?.transitionToNext) {
-                                TransitionType.SLIDE_LEFT -> (1f - transFrac) * 400f   // SLIDE LEFT: Starts on RIGHT (+400dp), moves LEFT to 0 (Center)
-                                TransitionType.SLIDE_RIGHT -> (1f - transFrac) * -400f // SLIDE RIGHT: Starts on LEFT (-400dp), moves RIGHT to 0 (Center)
+                        val transOffsetX = if (isTransitionActive) {
+                            when (activePreviewClip?.transitionToNext) {
+                                TransitionType.SLIDE_LEFT -> -(1f - transFrac) * 400f
+                                TransitionType.SLIDE_RIGHT -> (1f - transFrac) * 400f
                                 else -> 0f
                             }
                         } else 0f
 
-                        val transAlpha = if (playheadInClipMs < transDurationMs) {
-                            when (currentPlayingClip?.transitionToNext) {
-                                TransitionType.CROSSFADE, TransitionType.FADE_BLACK -> transFrac
+                        val transAlpha = if (isTransitionActive) {
+                            when (activePreviewClip?.transitionToNext) {
+                                TransitionType.CROSSFADE, TransitionType.FADE_BLACK -> 1f - transFrac
                                 else -> 1f
                             }
                         } else 1f
@@ -683,7 +689,7 @@ fun CanvasApp(
                         val clipTransY = (activeTransform?.translateYFraction ?: 0f) * 300f
                         val clipAlpha = (activeTransform?.opacity ?: 1f) * transAlpha
 
-                        val crop = currentPlayingClip?.cropRect ?: CropRect()
+                        val crop = activePreviewClip?.cropRect ?: CropRect()
                         val cropW = (crop.right - crop.left).coerceIn(0.05f, 1f)
                         val cropH = (crop.bottom - crop.top).coerceIn(0.05f, 1f)
                         val cropCenterX = (crop.left + crop.right) / 2f
@@ -700,7 +706,7 @@ fun CanvasApp(
                         val finalTransX = clipTransX + cropShiftX
                         val finalTransY = clipTransY + cropShiftY
 
-                        val flipX = if (currentPlayingClip?.isMirrored == true) -1f else 1f
+                        val flipX = if (activePreviewClip?.isMirrored == true) -1f else 1f
 
                         Box(
                             modifier = Modifier
@@ -726,9 +732,8 @@ fun CanvasApp(
                                 }
                             )
 
-                            // Live Color Filter Overlay
                             LiveColorFilterOverlay(
-                                filterPreset = currentPlayingClip?.filterPreset,
+                                filterPreset = activePreviewClip?.filterPreset,
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
@@ -1372,13 +1377,15 @@ fun VideoPlayer(
         }
     }
 
-    val audioPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            repeatMode = ExoPlayer.REPEAT_MODE_ALL
+    val audioPlayers = remember(audioClips.map { it.id }) {
+        audioClips.filter { !it.isMuted }.associate { audio ->
+            audio.id to ExoPlayer.Builder(context).build().apply {
+                repeatMode = ExoPlayer.REPEAT_MODE_ALL
+                volume = audio.volume
+            }
         }
     }
 
-    // Update video playlist whenever videoClips change
     LaunchedEffect(videoClips) {
         if (videoClips.isNotEmpty()) {
             val mediaItems = videoClips.map { clip ->
@@ -1400,7 +1407,6 @@ fun VideoPlayer(
         }
     }
 
-    // Handle speed on playback
     LaunchedEffect(videoClips) {
         if (videoClips.isNotEmpty()) {
             val currentIdx = videoPlayer.currentMediaItemIndex
@@ -1409,46 +1415,91 @@ fun VideoPlayer(
         }
     }
 
-    // Update audio playlist whenever audioClips change
     LaunchedEffect(audioClips) {
         val activeAudios = audioClips.filter { !it.isMuted }
-        if (activeAudios.isNotEmpty()) {
-            val items = activeAudios.map { audio ->
-                MediaItem.Builder()
-                    .setUri(audio.uri)
-                    .setClippingConfiguration(
-                        MediaItem.ClippingConfiguration.Builder()
-                            .setStartPositionMs(audio.trimStartMs)
-                            .setEndPositionMs(audio.trimEndMs)
-                            .build()
-                    )
-                    .build()
+        activeAudios.forEach { audio ->
+            val player = audioPlayers[audio.id] ?: ExoPlayer.Builder(context).build().apply {
+                repeatMode = ExoPlayer.REPEAT_MODE_ALL
+                volume = audio.volume
             }
-            audioPlayer.setMediaItems(items)
-            audioPlayer.prepare()
-            audioPlayer.playWhenReady = videoPlayer.isPlaying
-        } else {
-            audioPlayer.clearMediaItems()
+            val mediaItem = MediaItem.Builder()
+                .setUri(audio.uri)
+                .setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(audio.trimStartMs)
+                        .setEndPositionMs(audio.trimEndMs)
+                        .build()
+                )
+                .build()
+            if (player.currentMediaItem == null) {
+                player.setMediaItems(listOf(mediaItem))
+                player.prepare()
+            }
+        }
+
+        audioPlayers.keys.filter { key -> audioClips.none { it.id == key && !it.isMuted } }.forEach { key ->
+            audioPlayers[key]?.pause()
+            audioPlayers[key]?.seekTo(0L)
         }
     }
 
-    // Handle Volume / Mute
     LaunchedEffect(muteOriginal) {
         videoPlayer.volume = if (muteOriginal) 0f else 1f
     }
 
-    // Handle Play / Pause
-    LaunchedEffect(isPlaying) {
-        if (isPlaying) {
-            videoPlayer.play()
-            if (audioClips.any { !it.isMuted }) audioPlayer.play()
-        } else {
+    LaunchedEffect(isPlaying, audioClips, videoPlayer.currentMediaItemIndex, videoPlayer.currentPosition) {
+        if (!isPlaying) {
             videoPlayer.pause()
-            audioPlayer.pause()
+            audioPlayers.values.forEach { it.pause() }
+            return@LaunchedEffect
+        }
+
+        if (videoClips.isNotEmpty()) {
+            val currentIdx = videoPlayer.currentMediaItemIndex
+            val currentClip = videoClips.getOrNull(currentIdx)
+            val projectPosMs = if (currentIdx >= 0) {
+                var pos = 0L
+                for (i in 0 until currentIdx.coerceAtMost(videoClips.size)) {
+                    pos += videoClips[i].trimmedDurationMs
+                }
+                val rawPosInClipMs = videoPlayer.currentPosition
+                val clipSpeed = currentClip?.speed ?: 1.0f
+                val realPosInClipMs = (rawPosInClipMs / clipSpeed).toLong()
+                pos + realPosInClipMs
+            } else 0L
+
+            audioClips.filter { !it.isMuted }.forEach { audio ->
+                val player = audioPlayers[audio.id] ?: return@forEach
+                val relativePos = projectPosMs - audio.startTimeMs
+                val shouldPlay = relativePos in 0L..audio.trimmedDurationMs
+                if (shouldPlay) {
+                    if (player.currentMediaItem == null) {
+                        player.setMediaItems(listOf(
+                            MediaItem.Builder()
+                                .setUri(audio.uri)
+                                .setClippingConfiguration(
+                                    MediaItem.ClippingConfiguration.Builder()
+                                        .setStartPositionMs(audio.trimStartMs)
+                                        .setEndPositionMs(audio.trimEndMs)
+                                        .build()
+                                )
+                                .build()
+                        ))
+                        player.prepare()
+                    }
+                    player.volume = audio.volume
+                    player.seekTo(relativePos)
+                    player.play()
+                } else {
+                    player.pause()
+                    player.seekTo(0L)
+                }
+            }
+
+            videoPlayer.play()
         }
     }
 
-    // Handle Seeking across multi-video project timeline
     LaunchedEffect(seekToMs) {
         seekToMs?.let { targetMs ->
             if (videoClips.isNotEmpty()) {
@@ -1469,16 +1520,22 @@ fun VideoPlayer(
                 val targetClip = videoClips.getOrNull(targetIdx)
                 val speed = targetClip?.speed ?: 1.0f
                 val sourceClipOffsetMs = (clipOffsetProjectMs * speed).toLong()
-
                 videoPlayer.seekTo(targetIdx, sourceClipOffsetMs)
-                if (audioClips.isNotEmpty()) {
-                    audioPlayer.seekTo(targetMs)
+
+                audioClips.filter { !it.isMuted }.forEach { audio ->
+                    val player = audioPlayers[audio.id] ?: return@forEach
+                    val relativePos = targetMs - audio.startTimeMs
+                    player.seekTo(if (relativePos in 0L..audio.trimmedDurationMs) relativePos else 0L)
+                    if (isPlaying && relativePos in 0L..audio.trimmedDurationMs) {
+                        player.play()
+                    } else {
+                        player.pause()
+                    }
                 }
             }
         }
     }
 
-    // Monitor progress
     LaunchedEffect(videoPlayer, videoClips) {
         while (true) {
             if (videoPlayer.isPlaying && videoClips.isNotEmpty()) {
@@ -1500,11 +1557,10 @@ fun VideoPlayer(
         }
     }
 
-    // Clean lifecycle on exit
     DisposableEffect(Unit) {
         onDispose {
             videoPlayer.release()
-            audioPlayer.release()
+            audioPlayers.values.forEach { it.release() }
         }
     }
 

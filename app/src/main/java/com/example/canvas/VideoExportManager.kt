@@ -21,10 +21,10 @@ import android.provider.MediaStore
 import androidx.compose.ui.graphics.Color
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
+import androidx.media3.common.util.Size
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.Crop
-import androidx.media3.effect.GlMatrixTransformation
 import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.RgbFilter
 import androidx.media3.effect.RgbMatrix
@@ -77,6 +77,66 @@ import java.io.File
  * own OverlayEffect, which is a natural next step once you're comfortable
  * with this file.
  */
+private data class ExportVideoSequenceInfo(
+    val startMs: Long,
+    val durationMs: Long,
+    val transitionToNext: TransitionType,
+    val transitionDurationMs: Long
+)
+
+private class TimelineVideoCompositorSettings(
+    private val sequenceInfo: List<ExportVideoSequenceInfo>,
+    private val outputWidth: Int,
+    private val outputHeight: Int
+) : androidx.media3.common.VideoCompositorSettings {
+    override fun getOutputSize(inputSizes: List<Size>): Size {
+        val fallback = inputSizes.firstOrNull() ?: Size(1, 1)
+        return Size(
+            outputWidth.takeIf { it > 0 } ?: fallback.width,
+            outputHeight.takeIf { it > 0 } ?: fallback.height
+        )
+    }
+
+    override fun getOverlaySettings(inputId: Int, presentationTimeUs: Long): androidx.media3.common.OverlaySettings {
+        val info = sequenceInfo.getOrNull(inputId) ?: return StaticOverlaySettings.Builder().build()
+        val timeMs = (presentationTimeUs / 1000L - info.startMs).coerceAtLeast(0L)
+        val durationMs = info.transitionDurationMs.coerceAtLeast(1L)
+        val transitionStartMs = (info.durationMs - durationMs).coerceAtLeast(0L)
+
+        var alpha = 1f
+        var horizontalOffset = 0f
+
+        if (info.transitionToNext != TransitionType.NONE && timeMs >= transitionStartMs) {
+            val progress = ((timeMs - transitionStartMs).toFloat() / durationMs).coerceIn(0f, 1f)
+            when (info.transitionToNext) {
+                TransitionType.CROSSFADE, TransitionType.FADE_BLACK -> alpha = 1f - progress
+                TransitionType.SLIDE_LEFT -> horizontalOffset = -progress
+                TransitionType.SLIDE_RIGHT -> horizontalOffset = progress
+                TransitionType.NONE -> Unit
+            }
+        }
+
+        val previous = sequenceInfo.getOrNull(inputId - 1)
+        val incomingDurationMs = previous?.transitionDurationMs?.coerceAtLeast(1L) ?: durationMs
+        if (previous != null && previous.transitionToNext != TransitionType.NONE && timeMs < incomingDurationMs) {
+            val progress = (timeMs.toFloat() / incomingDurationMs).coerceIn(0f, 1f)
+            when (previous.transitionToNext) {
+                TransitionType.CROSSFADE -> alpha = progress
+                TransitionType.SLIDE_LEFT -> horizontalOffset = 1f - progress
+                TransitionType.SLIDE_RIGHT -> horizontalOffset = -(1f - progress)
+                TransitionType.FADE_BLACK -> alpha = progress
+                TransitionType.NONE -> Unit
+            }
+        }
+
+        return StaticOverlaySettings.Builder()
+            .setAlphaScale(alpha.coerceIn(0f, 1f))
+            .setBackgroundFrameAnchor(0f, 0f)
+            .setOverlayFrameAnchor(horizontalOffset.coerceIn(-1f, 1f), 0f)
+            .build()
+    }
+}
+
 @UnstableApi
 object VideoExportManager {
 
@@ -98,6 +158,7 @@ object VideoExportManager {
         }
 
         val outputFile = File(context.cacheDir, "canvas_export_${System.currentTimeMillis()}.mp4")
+        try {
         val (videoWidth, videoHeight) = getVideoDimensions(context, videoClips.first().uri)
 
         val textureOverlays = mutableListOf<TextureOverlay>()
@@ -116,7 +177,7 @@ object VideoExportManager {
         }
 
         // --- Step 1: Process each Video Clip with Trimming, Crop, Zoom & Rotation ---
-        val editedVideoItems = videoClips.map { clip ->
+        val editedVideoItems = videoClips.mapIndexed { index, clip ->
             val clippedMediaItem = MediaItem.Builder()
                 .setUri(clip.uri)
                 .setClippingConfiguration(
@@ -176,20 +237,58 @@ object VideoExportManager {
             val videoItemBuilder = EditedMediaItem.Builder(clippedMediaItem)
                 .setEffects(Effects(emptyList(), clipEffects))
 
-            if (muteOriginalAudio) {
-                videoItemBuilder.setRemoveAudio(true)
-            }
+            videoItemBuilder.setRemoveAudio(true)
 
             videoItemBuilder.build()
         }
 
-        // --- Step 2: Assemble Video Sequence ---
-        val videoSequence = if (muteOriginalAudio) {
-            EditedMediaItemSequence.withVideoFrom(editedVideoItems)
-        } else {
-            EditedMediaItemSequence.withAudioAndVideoFrom(editedVideoItems)
+        // --- Step 2: Assemble overlapping video sequences for real boundary transitions ---
+        val sequences = mutableListOf<EditedMediaItemSequence>()
+        val sequenceInfo = mutableListOf<ExportVideoSequenceInfo>()
+        var clipStartMs = 0L
+
+        editedVideoItems.forEachIndexed { index, item ->
+            val clip = videoClips[index]
+            val previousClip = videoClips.getOrNull(index - 1)
+            val overlapMs = if (previousClip?.transitionToNext != null && previousClip.transitionToNext != TransitionType.NONE) {
+                previousClip.transitionDurationMs.coerceAtLeast(100L).coerceAtMost(clip.trimmedDurationMs)
+            } else 0L
+            val sequenceStartMs = (clipStartMs - overlapMs).coerceAtLeast(0L)
+            val builder = EditedMediaItemSequence.Builder(emptyList<EditedMediaItem>())
+                .experimentalSetForceVideoTrack(true)
+            if (sequenceStartMs > 0L) builder.addGap(sequenceStartMs * 1000L)
+            builder.addItem(item)
+            sequences.add(builder.build())
+            sequenceInfo.add(
+                ExportVideoSequenceInfo(
+                    startMs = sequenceStartMs,
+                    durationMs = clip.trimmedDurationMs,
+                    transitionToNext = clip.transitionToNext,
+                    transitionDurationMs = clip.transitionDurationMs
+                )
+            )
+            clipStartMs += clip.trimmedDurationMs
         }
-        val sequences = mutableListOf(videoSequence)
+
+        if (!muteOriginalAudio) {
+            val originalAudioItems = videoClips.map { clip ->
+                val mediaItem = MediaItem.Builder()
+                    .setUri(clip.uri)
+                    .setClippingConfiguration(
+                        MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(clip.trimStartMs)
+                            .setEndPositionMs(clip.trimEndMs)
+                            .build()
+                    )
+                    .build()
+                EditedMediaItem.Builder(mediaItem).setRemoveVideo(true).build()
+            }
+            sequences.add(
+                EditedMediaItemSequence.Builder(originalAudioItems)
+                    .experimentalSetForceAudioTrack(true)
+                    .build()
+            )
+        }
 
         // --- Step 3: Add Background Audio Tracks (Constrained to Total Video Duration) ---
         val totalVideoDurationMs = videoClips.sumOf { it.trimmedDurationMs }.coerceAtLeast(1000L)
@@ -214,20 +313,37 @@ object VideoExportManager {
                     .setRemoveVideo(true)
                     .build()
 
-                sequences.add(EditedMediaItemSequence.withAudioFrom(listOf(audioEditedItem)))
+                sequences.add(
+                    EditedMediaItemSequence.Builder(listOf(audioEditedItem))
+                        .experimentalSetForceAudioTrack(true)
+                        .build()
+                )
             }
         }
 
         // --- Step 4: Build Media3 Composition ---
-        val composition = Composition.Builder(sequences).build()
+        val composition = Composition.Builder(sequences)
+            .setVideoCompositorSettings(
+                TimelineVideoCompositorSettings(
+                    sequenceInfo = sequenceInfo,
+                    outputWidth = videoWidth,
+                    outputHeight = videoHeight
+                )
+            )
+            .build()
         val mainHandler = Handler(Looper.getMainLooper())
 
         // --- Step 5: Start Asynchronous Media3 Transformer Job ---
         val transformer = Transformer.Builder(context)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    val savedUri = saveToGallery(context, outputFile)
-                    onComplete(savedUri)
+                    try {
+                        val savedUri = saveToGallery(context, outputFile)
+                        onComplete(savedUri)
+                    } catch (exception: Exception) {
+                        if (outputFile.exists()) outputFile.delete()
+                        onError(exception)
+                    }
                 }
 
                 override fun onError(
@@ -235,6 +351,7 @@ object VideoExportManager {
                     exportResult: ExportResult,
                     exportException: ExportException
                 ) {
+                    if (outputFile.exists()) outputFile.delete()
                     onError(exportException)
                 }
             })
@@ -258,6 +375,10 @@ object VideoExportManager {
             }
         }
         mainHandler.postDelayed(poller, 300)
+        } catch (exception: Exception) {
+            if (outputFile.exists()) outputFile.delete()
+            onError(exception)
+        }
     }
 
     private fun getMedia3ColorMatrixArray(preset: ColorFilterPreset): FloatArray {
